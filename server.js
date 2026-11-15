@@ -63,13 +63,14 @@ setInterval(() => { for (const c of conns) { if (!c.alive) { c.sock.destroy(); c
 /* ---------- rooms ---------- */
 const rooms = new Map(); let roomSeq = 1;
 const NAMES = ['Аврора', 'Бруно', 'Клара', 'Дарио', 'Эмиль', 'Фрида'];
-const roomPub = r => ({ id: r.id, name: r.name, lock: !!r.pass, host: r.host, max: r.max, opts: r.opts, started: !!r.S, members: r.members.map(m => ({ uid: m.uid, nick: m.nick, rp: m.rp, ready: m.ready, figure: m.figure, seat: m.seat, bot: m.bot || 0, online: m.bot ? true : !!m.online })) });
-const roomList = () => [...rooms.values()].map(r => ({ id: r.id, name: r.name, lock: !!r.pass, n: r.members.length, max: r.max, ranked: !!r.opts.ranked, started: !!r.S }));
+const mkCode = () => { for (;;) { let c = ''; for (let i = 0; i < 5; i++) c += 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[crypto.randomInt(32)]; if (![...rooms.values()].some(r => r.code === c)) return c; } };
+const roomPub = r => ({ id: r.id, code: r.code, name: r.name, lock: !!r.pass, host: r.host, max: r.max, opts: r.opts, started: !!r.S, members: r.members.map(m => ({ uid: m.uid, nick: m.nick, rp: m.rp, ready: m.ready, figure: m.figure, seat: m.seat, bot: m.bot || 0, online: m.bot ? true : !!m.online })) });
+const roomList = () => [...rooms.values()].map(r => ({ id: r.id, code: r.code, name: r.name, lock: !!r.pass, n: r.members.length, max: r.max, ranked: !!r.opts.ranked, started: !!r.S }));
 const cast = (r, o, except) => { for (const m of r.members) { if (m.bot || m.uid === except) continue; const c = byUid.get(m.uid); if (c && c.room === r) c.send(o); } };
 const lobbyCast = () => { const l = { t: 'rooms', list: roomList() }; for (const c of conns) if (c.user && !c.room) c.send(l); };
 const sys = (r, text) => { const m = { t: 'chat', sys: 1, text, ts: now() }; r.chat.push(m); cast(r, m); };
 function freeSeat(r) { for (let s = 0; s < 4; s++) if (!r.members.some(m => m.seat === s)) return s; return -1; }
-function persist(r) { if (r.S) run('INSERT OR REPLACE INTO room_state VALUES(?,?,?)', r.id, now(), JSON.stringify({ id: r.id, name: r.name, pass: r.pass, salt: r.salt, host: r.host, max: r.max, opts: r.opts, members: r.members.map(m => Object.assign({}, m, { online: false })), S: r.S, ranked: r.ranked, mt: r.mt })); }
+function persist(r) { if (r.S) run('INSERT OR REPLACE INTO room_state VALUES(?,?,?)', r.id, now(), JSON.stringify({ id: r.id, code: r.code, name: r.name, pass: r.pass, salt: r.salt, host: r.host, max: r.max, opts: r.opts, members: r.members.map(m => Object.assign({}, m, { online: false })), S: r.S, ranked: r.ranked, mt: r.mt })); }
 function drop(r) { clearTimeout(r.tm); rooms.delete(r.id); run('DELETE FROM room_state WHERE id=?', r.id); for (const m of r.members) { const c = byUid.get(m.uid); if (c && c.room === r) { c.room = null; c.send({ t: 'left' }); } } lobbyCast(); }
 function leave(c) {
   const r = c.room; if (!r) return; c.room = null; const uid = c.user.id; c.send({ t: 'left' });
@@ -136,14 +137,14 @@ function onMsg(c, m) {
     case 'appeal': run('INSERT INTO appeals(ts,uid,text) VALUES(?,?,?)', now(), u.id, String(m.text || '').slice(0, 400)); return;
     case 'report': run('INSERT INTO reports(ts,from_uid,about_uid,why,ctx) VALUES(?,?,?,?,?)', now(), u.id, m.uid | 0, String(m.why || '').slice(0, 40), r ? JSON.stringify(r.chat.filter(x => x.from && x.from.uid === (m.uid | 0)).slice(-10)) : ''); return;
     case 'create': { if (r) return err('Вы уже в комнате'); const name = cleanNick(m.name).slice(0, 30) || 'Стол ' + u.nick; const max = clamp(m.max | 0, 2, 4); const salt = crypto.randomBytes(6).toString('hex'); const pass = m.pass ? hash(m.pass, salt) : null;
-      const R = { id: 'r' + (roomSeq++) + crypto.randomBytes(2).toString('hex'), name, pass, salt, max, host: u.id, opts: { cash: [1000, 1500, 2000, 2500].includes(m.cash) ? m.cash : 1500, mode: m.mode === 'fast' ? 'fast' : 'classic', ranked: !!m.ranked, speed: m.speed || 'full' }, members: [], chat: [], S: null };
+      const R = { id: 'r' + (roomSeq++) + crypto.randomBytes(2).toString('hex'), code: mkCode(), name, pass, salt, max, host: u.id, opts: { cash: [1000, 1500, 2000, 2500].includes(m.cash) ? m.cash : 1500, mode: m.mode === 'fast' ? 'fast' : 'classic', ranked: !!m.ranked, speed: m.speed || 'full' }, members: [], chat: [], S: null };
       R.members.push({ uid: u.id, nick: u.nick, rp: u.rp, figure: u.figure, ready: true, seat: 0, online: true }); for (let i = 0; i < clamp(m.bots | 0, 0, max - 1); i++) R.members.push({ uid: null, nick: NAMES[i], rp: 0, figure: (i + 1) & 3, ready: true, seat: i + 1, bot: 3 });
       rooms.set(R.id, R); c.room = R; c.send({ t: 'room', room: roomPub(R) }); return lobbyCast(); }
-    case 'join': { if (r) return err('Вы уже в комнате'); const R = rooms.get(String(m.id)); if (!R) return err('Комната не найдена'); if (R.S) return err('Партия уже идёт'); if (R.members.length >= R.max) return err('Свободных мест нет');
+    case 'join': { if (r) return err('Вы уже в комнате'); const jc = String(m.code || '').trim().toUpperCase(); const R = m.code ? [...rooms.values()].find(x => x.code === jc) : rooms.get(String(m.id)); if (!R) return err(m.code ? 'Лобби с таким кодом нет. Проверьте код' : 'Лобби не найдено'); if (R.S) return err('Партия уже идёт'); if (R.members.length >= R.max) return err('Свободных мест нет');
       if (R.pass) { c.pwTries = (c.pwTries || 0) + 1; if (c.pwTries > 10) return err('Слишком много попыток'); if (!m.pass || !crypto.timingSafeEqual(Buffer.from(hash(m.pass, R.salt)), Buffer.from(R.pass))) return err('Неверный пароль'); }
       R.members.push({ uid: u.id, nick: u.nick, rp: u.rp, figure: u.figure, ready: false, seat: freeSeat(R), online: true }); c.room = R; cast(R, { t: 'room', room: roomPub(R) }); for (const ch of R.chat.slice(-40)) c.send(ch); sys(R, `${u.nick} садится за стол`); for (const x of R.members) if (x.voice && x.uid !== u.id) c.send({ t: 'voice', uid: x.uid, on: true }); return lobbyCast(); }
     case 'leave': if (r) { leave(c); c.send({ t: 'rooms', list: roomList() }); } return;
-    case 'invite': { if (!r) return err('Сначала создайте комнату'); const t = byUid.get(m.uid | 0); if (!t) return err('Игрок не в сети'); if (now() - (c.invT || 0) < 2000) return; c.invT = now(); return t.send({ t: 'invited', from: u.nick, room: { id: r.id, name: r.name, lock: !!r.pass } }); }
+    case 'invite': { if (!r) return err('Сначала создайте комнату'); const t = byUid.get(m.uid | 0); if (!t) return err('Игрок не в сети'); if (now() - (c.invT || 0) < 2000) return; c.invT = now(); return t.send({ t: 'invited', from: u.nick, room: { id: r.id, code: r.code, name: r.name, lock: !!r.pass } }); }
   }
   if (!need(c, true)) return; const me = r.members.find(x => x.uid === u.id);
   switch (m.t) {
@@ -170,7 +171,7 @@ function onMsg(c, m) {
       }
       const res = apply(r, i, a); if (!res.ok) err(res.err); return;
     }
-    case 'chat': { const t = now(); if (c.mute > t) return err('Вы временно не можете писать в чат'); c.chatT = c.chatT.filter(x => t - x < 8000); if (c.chatT.length >= 5) { if (++c.strikes >= 3) { c.mute = t + 60000; c.strikes = 0; } return err('Слишком часто. Подождите пару секунд'); } c.chatT.push(t); const text = String(m.text || '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').trim().slice(0, 300); if (!text) return; const msg = { t: 'chat', from: { uid: u.id, nick: u.nick }, text, ts: t }; r.chat.push(msg); if (r.chat.length > 100) r.chat.shift(); return cast(r, msg); }
+    case 'chat': { const t = now(); if (c.mute > t) return err('Вы временно не можете писать в чат'); c.chatT = c.chatT.filter(x => t - x < 8000); if (c.chatT.length >= 5) { if (++c.strikes >= 3) { c.mute = t + 60000; c.strikes = 0; } return err('Слишком часто. Подождите пару секунд'); } c.chatT.push(t); const text = String(m.text || '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').trim().slice(0, 300); if (!text) return; const msg = { t: 'chat', id: crypto.randomBytes(5).toString('hex'), from: { uid: u.id, nick: u.nick }, text, ts: t }; r.chat.push(msg); if (r.chat.length > 100) r.chat.shift(); return cast(r, msg); }
     case 'voice': me.voice = !!m.on; cast(r, { t: 'voice', uid: u.id, on: me.voice }, u.id); if (me.voice) for (const x of r.members) if (x.voice && x.uid !== u.id) c.send({ t: 'voice', uid: x.uid, on: true }); return;
     case 'rtc': { const t = r.members.find(x => x.uid === (m.to | 0)); const tc = t && byUid.get(t.uid); if (!tc || tc.room !== r || JSON.stringify(m.data || {}).length > 16000) return; return tc.send({ t: 'rtc', from: u.id, data: m.data }); }
   }
@@ -178,7 +179,7 @@ function onMsg(c, m) {
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
 /* restore unfinished games after a restart */
-for (const row of q('SELECT data FROM room_state')) { try { const d = JSON.parse(row.data); const r = Object.assign({ chat: [] }, d); r.mt = r.mt || {}; r.emptyAt = now(); rooms.set(r.id, r); schedule(r, 3000); } catch (e) { } }
+for (const row of q('SELECT data FROM room_state')) { try { const d = JSON.parse(row.data); const r = Object.assign({ chat: [] }, d); if (!r.code) r.code = mkCode(); r.mt = r.mt || {}; r.emptyAt = now(); rooms.set(r.id, r); schedule(r, 3000); } catch (e) { } }
 const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ name: 'OLiaMono server', ok: true, rooms: rooms.size, online: byUid.size, season: SEASON.name })); });
 server.on('upgrade', (req, sock) => { if ((req.headers.upgrade || '').toLowerCase() !== 'websocket') return sock.destroy(); accept(req, sock); });
 server.listen(PORT, () => console.log('OLiaMono server listening on :' + PORT));
